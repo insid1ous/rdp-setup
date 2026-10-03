@@ -142,16 +142,16 @@ try {
 <ProxifierProfile version="102" platform="Windows" product_id="0" product_minver="400">
   <Options>
     <Resolve>
-      <AutoModeDetection enabled="true" />
-      <ViaProxy enabled="false" />
-      <BlockNonATypes enabled="false" />
+    	<AutoModeDetection enabled="false" />
+    	<ViaProxy enabled="true" />
+    	<BlockNonATypes enabled="true" />
       <ExclusionList OnlyFromListMode="false">%ComputerName%; localhost; *.local</ExclusionList>
       <DnsUdpMode>0</DnsUdpMode>
     </Resolve>
     <Encryption mode="disabled" />
     <ConnectionLoopDetection enabled="true" resolve="true" />
-    <Udp mode="mode_bypass" />
-    <LeakPreventionMode enabled="false" />
+    <Udp mode="mode_block_all" />
+    <LeakPreventionMode enabled="true" />
     <ProcessOtherUsers enabled="false" />
     <ProcessServices enabled="false" />
     <HandleDirectConnections enabled="false" />
