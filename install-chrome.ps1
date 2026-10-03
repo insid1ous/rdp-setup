@@ -326,4 +326,6 @@ try {
         Remove-Item -LiteralPath $chromeInstaller -Force -ErrorAction SilentlyContinue
     }
 }
+Write-Host "Script finished with exit code $exitCode. Review the output above."
+Read-Host 'Press Enter to exit' | Out-Null
 exit $exitCode

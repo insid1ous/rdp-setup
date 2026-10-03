@@ -185,4 +185,6 @@ try {
 } catch {
     Write-Error -Message $_.Exception.Message -ErrorAction Continue
 }
+Write-Host "Script finished with exit code $exitCode. Review the output above."
+Read-Host 'Press Enter to exit' | Out-Null
 exit $exitCode
