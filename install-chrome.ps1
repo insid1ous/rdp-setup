@@ -1,22 +1,75 @@
 #Requires -Version 5.1
 #Requires -RunAsAdministrator
 <#
-Run after Setup-Proxifier.ps1. Does not stop or reconfigure Proxifier.
-Requires curl.exe. Uses ordinary connections intercepted by the existing proxy.
+Run as administrator under the Windows account that will use Proxifier,
+after basic-setup.ps1 and a manual restart.
+Requires curl.exe (included with current Windows 10/11 installations).
+Prompts for a SOCKS5 proxy, installs/configures Proxifier, and verifies routing.
+The supplied profile stores the proxy password in plaintext, as requested.
+Use -SystemWideLicense to register in HKLM instead of HKCU.
+A timeout does not uninstall or stop Proxifier or undo configuration.
 Checks the public IP and observed DNS resolver using whoer.to's live check flow:
 https://whoer.to/ip -> /ip2co; random.edns.ip-api.com/json -> /ip2co.
-Both must report DE in the same attempt within 180 seconds; otherwise no download.
+Both must report DE in the same attempt within 180 seconds; otherwise no Chrome download.
 This checks the resolver observed by that test, not every resolver or browser DoH.
 These are website endpoints, not a guaranteed stable API. Unknown results fail closed.
-Exit codes: 0 = installer completed; 1 = failure; 2 = country-check timeout.
+Exit codes: 0 = installer completed; 1 = failure; 2 = proxy or country-check timeout.
 #>
 [CmdletBinding()]
-param()
+param(
+    [switch]$SystemWideLicense
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'Continue'
 $chromeInstaller = $null
+$installer = $null
+$proxyPassword = $null
 $exitCode = 1
+
+# curl config is passed over stdin so credentials do not appear in its command line.
+function ConvertTo-CurlQuoted([string]$Value) {
+    if ($Value -match '[\r\n\x00]') { throw 'Input cannot contain line breaks or NUL.' }
+    '"' + $Value.Replace('\', '\\').Replace('"', '\"').Replace("`t", '\t') + '"'
+}
+
+function Get-PublicIp {
+    param([string]$ProxyEndpoint, [string]$Credentials, [double]$Timeout = 20)
+    $seconds = $Timeout.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)
+    $config = @(
+        'url = "https://api.ipify.org/?format=plain"'
+        'silent'
+        'fail'
+        'ipv4'
+        "max-time = $seconds"
+        'connect-timeout = 10'
+    )
+    if ($ProxyEndpoint) {
+        $config += 'proxy = ' + (ConvertTo-CurlQuoted $ProxyEndpoint)
+        $config += 'proxy-user = ' + (ConvertTo-CurlQuoted $Credentials)
+        $config += 'noproxy = ""'
+    } else {
+        # No application-level proxy: Proxifier must intercept the connection.
+        $config += 'proxy = ""'
+        $config += 'noproxy = "*"'
+    }
+    $oldEncoding = $OutputEncoding
+    try {
+        $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $response = ($config -join "`n") | & $script:CurlPath --disable --config -
+        $curlExit = $LASTEXITCODE
+    } finally {
+        $OutputEncoding = $oldEncoding
+    }
+    if ($curlExit -ne 0) { throw "IP request failed (curl exit code $curlExit)." }
+    $value = ($response -join '').Trim()
+    $parsed = $null
+    if (-not [Net.IPAddress]::TryParse($value, [ref]$parsed)) {
+        throw 'ipify did not return a valid IP address.'
+    }
+    $parsed.ToString()
+}
+
 
 function Get-CheckResponse([string]$Uri) {
     $remaining = 180 - $script:checkTimer.Elapsed.TotalSeconds
@@ -55,7 +108,156 @@ function Get-WhoerCountry([string]$Ip) {
 
 try {
     $script:CurlPath = (Get-Command curl.exe -CommandType Application -ErrorAction Stop).Source
+    $proxyIp = (Read-Host 'SOCKS5 proxy IP address').Trim()
+    $parsedProxy = $null
+    if (-not [Net.IPAddress]::TryParse($proxyIp, [ref]$parsedProxy)) {
+        throw 'Enter a valid IPv4 or IPv6 proxy address.'
+    }
+    $proxyPort = 0
+    if (-not [int]::TryParse((Read-Host 'SOCKS5 proxy port'), [ref]$proxyPort) -or
+        $proxyPort -lt 1 -or $proxyPort -gt 65535) { throw 'Port must be 1-65535.' }
+    $proxyUsername = Read-Host 'SOCKS5 proxy username'
+    if ([string]::IsNullOrEmpty($proxyUsername) -or $proxyUsername.Contains(':')) {
+        throw 'Username must be nonempty and cannot contain a colon (curl limitation).'
+    }
+    $securePassword = Read-Host 'SOCKS5 proxy password' -AsSecureString
+    $proxyPassword = (New-Object System.Net.NetworkCredential('', $securePassword)).Password
+    if ([string]::IsNullOrEmpty($proxyPassword)) { throw 'Password cannot be empty.' }
+    foreach ($credentialPart in @($proxyUsername, $proxyPassword)) {
+        $byteCount = [Text.Encoding]::UTF8.GetByteCount($credentialPart)
+        if ($byteCount -gt 255) { throw 'SOCKS5 credentials must each fit in 255 UTF-8 bytes.' }
+    }
+    $addressForUrl = $parsedProxy.ToString()
+    if ($parsedProxy.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+        $addressForUrl = '[' + $addressForUrl + ']'
+    }
+    Write-Host 'Validating SOCKS5 proxy...'
+    $proxyPublicIp = Get-PublicIp -ProxyEndpoint "socks5h://${addressForUrl}:$proxyPort" `
+        -Credentials ($proxyUsername + ':' + $proxyPassword)
+    Write-Host "Proxy public IP: $proxyPublicIp"
+
+    # Single-quoted here-string preserves literal %ComputerName% tokens.
+    [xml]$profile = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ProxifierProfile version="102" platform="Windows" product_id="0" product_minver="400">
+  <Options>
+    <Resolve>
+      <AutoModeDetection enabled="true" />
+      <ViaProxy enabled="false" />
+      <BlockNonATypes enabled="false" />
+      <ExclusionList OnlyFromListMode="false">%ComputerName%; localhost; *.local</ExclusionList>
+      <DnsUdpMode>0</DnsUdpMode>
+    </Resolve>
+    <Encryption mode="disabled" />
+    <ConnectionLoopDetection enabled="true" resolve="true" />
+    <Udp mode="mode_bypass" />
+    <LeakPreventionMode enabled="false" />
+    <ProcessOtherUsers enabled="false" />
+    <ProcessServices enabled="false" />
+    <HandleDirectConnections enabled="false" />
+    <HttpProxiesSupport enabled="false" />
+  </Options>
+  <ProxyList>
+    <Proxy id="101" type="SOCKS5">
+      <Authentication enabled="true">
+        <Password />
+        <Username />
+      </Authentication>
+      <Options>48</Options>
+      <Port />
+      <Address />
+    </Proxy>
+  </ProxyList>
+  <ChainList />
+  <RuleList>
+    <Rule enabled="true">
+      <Action type="Direct" />
+      <Targets>localhost; 127.0.0.1; %ComputerName%; ::1</Targets>
+      <Name>Localhost</Name>
+    </Rule>
+    <Rule enabled="true">
+      <Action type="Proxy">101</Action>
+      <Name>Default</Name>
+    </Rule>
+  </RuleList>
+</ProxifierProfile>
+'@
+    # InnerText correctly escapes XML-sensitive characters in all input.
+    $profile.SelectSingleNode('//Proxy/Authentication/Password').InnerText = $proxyPassword
+    $profile.SelectSingleNode('//Proxy/Authentication/Username').InnerText = $proxyUsername
+    $profile.SelectSingleNode('//Proxy/Port').InnerText = [string]$proxyPort
+    $profile.SelectSingleNode('//Proxy/Address').InnerText = $parsedProxy.ToString()
+    $profileDir = Join-Path $env:APPDATA 'Proxifier4\Profiles'
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $profilePath = Join-Path $profileDir 'Default.ppx'
+    if (Test-Path -LiteralPath $profilePath) {
+        $backup = $profilePath + '.' + [Guid]::NewGuid().ToString('N') + '.bak'
+        Copy-Item -LiteralPath $profilePath -Destination $backup
+        Write-Host "Previous profile backed up to: $backup"
+    }
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = $true
+    $settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+    $writer = [Xml.XmlWriter]::Create($profilePath, $settings)
+    try { $profile.Save($writer) } finally { $writer.Dispose() }
+    Write-Host "Profile saved: $profilePath"
+
+    # Proxifier is a 32-bit application; explicitly use its registry view.
+    $hive = [Microsoft.Win32.RegistryHive]::CurrentUser
+    if ($SystemWideLicense) { $hive = [Microsoft.Win32.RegistryHive]::LocalMachine }
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Registry32)
+    try {
+        $license = $baseKey.CreateSubKey('Software\Initex\Proxifier\License')
+        try {
+            $license.SetValue('Key', 'DAZPH-G39D3-R4QY7-9PVAY-VQ6BU', [Microsoft.Win32.RegistryValueKind]::String)
+            $license.SetValue('Owner', 'insid1ous', [Microsoft.Win32.RegistryValueKind]::String)
+        } finally { $license.Dispose() }
+    } finally { $baseKey.Dispose() }
+
+    $installer = Join-Path ([IO.Path]::GetTempPath()) ('ProxifierSetup-' + [Guid]::NewGuid().ToString('N') + '.exe')
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Write-Host 'Downloading Proxifier...'
+    Invoke-WebRequest -Uri 'https://www.proxifier.com/download/ProxifierSetup.exe' `
+        -OutFile $installer -UseBasicParsing -TimeoutSec 120
+    Write-Host 'Installing Proxifier...'
+    $setup = Start-Process -FilePath $installer -ArgumentList '/SILENT', '/NORESTART' -Wait -PassThru
+    if ($setup.ExitCode -ne 0) { throw "Installer returned exit code $($setup.ExitCode)." }
+
+    $exe = 'C:\Program Files (x86)\Proxifier\Proxifier.exe'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Proxifier executable not found: $exe" }
+    Write-Host 'Starting Proxifier and loading Default.ppx...'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    Start-Process -FilePath $exe -ArgumentList ('"' + $profilePath + '" silent-load') | Out-Null
+    $matched = $false
+    $lastResult = 'No successful IP response.'
+    while ($timer.Elapsed.TotalSeconds -lt 180) {
+        $remaining = 180 - $timer.Elapsed.TotalSeconds
+        if ($remaining -lt 0.1) { break }
+        try {
+            $observedIp = Get-PublicIp -Timeout ([Math]::Min(10, $remaining))
+            $lastResult = "Last observed IP: $observedIp"
+            if ($observedIp -eq $proxyPublicIp -and $timer.Elapsed.TotalSeconds -le 180) {
+                $matched = $true
+                break
+            }
+            Write-Host "Current IP: $observedIp; waiting for $proxyPublicIp..."
+        } catch {
+            $lastResult = $_.Exception.Message
+            Write-Host 'IP check failed; retrying...'
+        }
+        $remaining = 180 - $timer.Elapsed.TotalSeconds
+        if ($remaining -gt 0) {
+            Start-Sleep -Milliseconds ([int][Math]::Min(5000, $remaining * 1000))
+        }
+    }
+    $timer.Stop()
+    if (-not $matched) {
+        $exitCode = 2
+        throw "Aborted: normal requests did not return $proxyPublicIp within 3 minutes. $lastResult"
+    }
+    Write-Host "Success: normal requests now return $proxyPublicIp." -ForegroundColor Green
+
+
     $script:checkTimer = [Diagnostics.Stopwatch]::StartNew()
     $verified = $false
     $lastResult = 'No successful check.'
@@ -116,6 +318,10 @@ try {
 } catch {
     Write-Error -Message $_.Exception.Message -ErrorAction Continue
 } finally {
+    $proxyPassword = $null
+    if ($installer -and (Test-Path -LiteralPath $installer)) {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+    }
     if ($chromeInstaller -and (Test-Path -LiteralPath $chromeInstaller)) {
         Remove-Item -LiteralPath $chromeInstaller -Force -ErrorAction SilentlyContinue
     }
