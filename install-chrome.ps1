@@ -61,7 +61,7 @@ function Get-PublicIp {
     } finally {
         $OutputEncoding = $oldEncoding
     }
-    if ($curlExit -ne 0) { throw "IP request failed (curl exit code $curlExit)." }
+    if ($curlExit -ne 0) { throw "IP request failed (curl exit code $curlExit). Response: $response" }
     $value = ($response -join '').Trim()
     $parsed = $null
     if (-not [Net.IPAddress]::TryParse($value, [ref]$parsed)) {
